@@ -169,6 +169,19 @@ function firstNonSpace(s) {
   return i < n ? i : -1;
 }
 
+// Is this one character punctuation or whitespace, but not * or _? ASCII
+// characters are decided by range; anything else falls back to the pattern.
+function isPunctOrSpace(ch) {
+  if (!ch) return false;
+  const c = ch.charCodeAt(0);
+  if (c === 42 || c === 95) return false;
+  if (c < 128) {
+    return c === 32 || (c >= 9 && c <= 13) ||
+      (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+  }
+  return PUNCT_TEST.exec(ch) !== null;
+}
+
 function scanCloserRuns(src) {
   const found = { '*': -1, _: -1, '~': -1 };
   const n = src.length;
@@ -380,24 +393,94 @@ const PUNCT_TEST = new RegExp('^((?![*_])' + PUNCT_SPACE + ')', 'u');
 // An escaped punctuation mark, anywhere (used to fold \X to X).
 const ESCAPED_PUNCT = new RegExp('\\\\(' + PUNCT + ')', 'gu');
 
-// Plain text: a run that stops where another inline construct could start —
-// before a backtick, tilde, backslash, <, !, [, * or a word-boundary _, before
-// a URL or email start, and before a hard break. The first character may also
-// be a lone non-alphanumeric ahead of a mailto:/xmpp: scheme.
-const EMAIL_LOCAL = "[a-zA-Z0-9.!#$%&'*+\\/=?_`{|}~-]+";
-const PROTOCOL = '[hH][tT][tT][pP][sS]?|[fF][tT][pP]';
-const EMAIL_PROTO = '(?:mailto|xmpp):';
-const WWW_START = '(?<![^\\s*_~(])www\\.';
-const TEXT_RE = new RegExp(
-  '^(?:[^a-zA-Z0-9](?=' + EMAIL_PROTO + ')|(`+|~+|[^`~])(?:(?=[`~])|(?= {2,}\\n)|(?=' + EMAIL_LOCAL + '@)' +
-  '|[\\s\\S]*?(?:(?=[\\\\<!\\[`*~_]|\\b_|' + PROTOCOL + ':\\/\\/|' + WWW_START + '|$)|[^ ](?= {2,}\\n)' +
-  '|[^a-zA-Z0-9](?=' + EMAIL_PROTO + ')|[^a-zA-Z0-9.!#$%&\'*+\\/=?_`{|}~-](?=' + EMAIL_LOCAL + '@))))');
+// The characters a plain-text run stops before: an escape, tag, image/link,
+// code span, emphasis, strikethrough or underscore.
+const TEXT_STOP = /[\\<!\[`*~_]/g;
 
-// Anything that can start an inline construct: an escape, tag, link, image,
+function isAlnumChar(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+// Is this code a character an email local part may hold?
+function isEmailLocalChar(c) {
+  if (c >= 48 && c <= 57) return true;
+  if (c >= 65 && c <= 90) return true;
+  if (c >= 97 && c <= 122) return true;
+  return c === 46 || c === 33 || c === 35 || c === 36 || c === 37 || c === 38 ||
+    c === 39 || c === 42 || c === 43 || c === 47 || c === 61 || c === 63 ||
+    c === 94 || c === 95 || c === 96 || c === 123 || c === 124 || c === 125 ||
+    c === 126 || c === 45;
+}
+
+// May a www. host start after this character — the start, whitespace, or *_~(.
+function isWwwBefore(c) {
+  if (c === 32 || (c >= 9 && c <= 13) || c === 42 || c === 95 || c === 126 || c === 40) return true;
+  return c > 127 && /\s/.test(String.fromCharCode(c));
+}
+
+// Where the plain-text run starting at the head of `rest` ends: before the
+// first escape, tag, link, code span, emphasis, strikethrough or underscore,
+// before a www. host or http(s)/ftp URL, before an email address's local
+// part, or before two spaces ahead of a newline. The first character — a
+// backtick or tilde run, or one character — is always kept.
+function textRunEnd(rest) {
+  const n = rest.length;
+  const c0 = rest.charCodeAt(0);
+  if (!isAlnumChar(c0) && (rest.startsWith('mailto:', 1) || rest.startsWith('xmpp:', 1))) return 1;
+  let start = 1;
+  if (c0 === 96 || c0 === 126) {
+    while (start < n && rest.charCodeAt(start) === c0) start++;
+  }
+  let end = n;
+  TEXT_STOP.lastIndex = start;
+  const stopMatch = TEXT_STOP.exec(rest);
+  if (stopMatch) end = stopMatch.index;
+  let w = rest.indexOf('www.', start);
+  while (w !== -1 && w < end) {
+    if (isWwwBefore(rest.charCodeAt(w - 1))) { end = w; break; }
+    w = rest.indexOf('www.', w + 1);
+  }
+  let s = rest.indexOf('://', start);
+  while (s !== -1 && s < end) {
+    let schemeStart = -1;
+    if (s >= 5 && rest.slice(s - 5, s).toLowerCase() === 'https') schemeStart = s - 5;
+    else if (s >= 4 && rest.slice(s - 4, s).toLowerCase() === 'http') schemeStart = s - 4;
+    else if (s >= 3 && rest.slice(s - 3, s).toLowerCase() === 'ftp') schemeStart = s - 3;
+    if (schemeStart !== -1 && schemeStart >= start) { end = schemeStart; break; }
+    s = rest.indexOf('://', s + 1);
+  }
+  // The local part may span _ * ~ ! ` stop characters, so the @ itself can
+  // sit past the current end while the stop still falls before it.
+  let at = rest.indexOf('@', start);
+  while (at !== -1) {
+    let b = at - 1;
+    while (b >= 0 && isEmailLocalChar(rest.charCodeAt(b))) b--;
+    const localStart = b + 1;
+    const stop = localStart < start ? start : localStart;
+    if (stop < at) {
+      if (stop < end) end = stop;
+      break;
+    }
+    at = rest.indexOf('@', at + 1);
+  }
+  const br = rest.indexOf('  \n', start);
+  if (br !== -1 && br < end) {
+    let sp = br;
+    while (sp > start && rest.charCodeAt(sp - 1) === 32) sp--;
+    end = sp;
+  }
+  return end;
+}
+
+const PROTOCOL = '[hH][tT][tT][pP][sS]?|[fF][tT][pP]';
+
+// Anything that can start an inline construct: an escape, tag, link,
 // emphasis, code span or strikethrough delimiter, a URL or email start, or a
 // hard break's two spaces before a newline. A span without any of these is
 // plain text.
 const INLINE_TRIGGER = /[\\<\[*_`~]|!\[|www\.|:\/\/|@|  \n/;
+const HAS_DELIM = /[*_~]/;
+const MASK_TRIGGER = /[\[`<>\\]/;
 
 // An emphasis opener: a run of * or _ followed by punctuation (but not ~)
 // or by a non-space character. Groups 1/3 hold the punctuation after a
@@ -1063,7 +1146,6 @@ class Engine {
   // path and skip the loop, the mask and the closer scan entirely.
   lexInline(src, tokens) {
     const savedParen = this.parenPossible;
-    this.parenPossible = savedParen && src.includes(')');
     try {
       if (src === '') return tokens;
       if (!INLINE_TRIGGER.test(src)) {
@@ -1071,10 +1153,9 @@ class Engine {
         else tokens.push({ type: 'text', raw: src, text: src.includes('&') ? decodeNumericRefs(src) : src, escaped: false });
         return tokens;
       }
-      const hasDelim = src.includes('*') || src.includes('_') || src.includes('~');
-      const masked = hasDelim &&
-        (src.includes('[') || src.includes('`') || src.includes('<') || src.includes('\\'))
-        ? this.maskEmphasis(src) : src;
+      this.parenPossible = savedParen && src.includes(')');
+      const hasDelim = HAS_DELIM.test(src);
+      const masked = hasDelim && MASK_TRIGGER.test(src) ? this.maskEmphasis(src) : src;
       const closers = hasDelim ? scanCloserRuns(masked) : null;
       return this.lexInlineLoop(src, masked, closers, tokens);
     } finally {
@@ -1207,9 +1288,7 @@ class Engine {
   }
 
   tryInlineText(rest) {
-    const m = TEXT_RE.exec(rest);
-    if (!m) return null;
-    const raw = m[0];
+    const raw = rest.slice(0, textRunEnd(rest));
     return { type: 'text', raw, text: this.inRaw ? raw : decodeNumericRefs(raw), escaped: this.inRaw };
   }
 
@@ -1312,10 +1391,10 @@ class Engine {
     let runStart = pos;
     while (runStart > 0 && masked[runStart - 1] === delim) runStart--;
     const beforeRun = lastCodePoint(masked.slice(Math.max(0, runStart - 2), runStart));
-    const beforeRunIsPunct = beforeRun === '*' || beforeRun === '_' || !!PUNCT_TEST.exec(beforeRun);
+    const beforeRunIsPunct = beforeRun === '*' || beforeRun === '_' || isPunctOrSpace(beforeRun);
     let before = prevChar;
     if (runStart < pos) before = beforeRun;
-    const beforeIsPunct = runStart < pos ? beforeRunIsPunct : !!PUNCT_TEST.exec(before);
+    const beforeIsPunct = runStart < pos ? beforeRunIsPunct : isPunctOrSpace(before);
     if (m[4] && before.match(ALPHA_NUMERIC)) return null;
     const afterIsPunct = m[1] || m[3] || '';
     if (!afterIsPunct || !before || beforeIsPunct) {
@@ -1367,7 +1446,7 @@ class Engine {
   tryDel(rest, masked, pos, prevChar, closers) {
     const m = DEL_OPEN.exec(rest);
     if (!m) return null;
-    if (!(m[1] || '') || !prevChar || PUNCT_TEST.exec(prevChar)) {
+    if (!(m[1] || '') || !prevChar || isPunctOrSpace(prevChar)) {
       const openLen = m[0][1] === '~' ? 2 : 1;
       let remaining = openLen;
       const lastCloser = closers['~'];
@@ -1526,7 +1605,7 @@ const URL_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]{1,31}:\/\//;
 /** The HTML marked 18.1.3 renders for `markdown`, with marked's defaults. */
 export function parse(markdown) {
   const engine = new Engine();
-  const src = markdown.replace(CARRIAGE_RETURN, '\n');
+  const src = markdown.includes('\r') ? markdown.replace(CARRIAGE_RETURN, '\n') : markdown;
   const tokens = engine.lexBlocks(src, []);
   for (let i = 0; i < engine.queue.length; i++) {
     const job = engine.queue[i];
