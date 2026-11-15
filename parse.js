@@ -139,6 +139,36 @@ function expandTabs(text, startCol = 0) {
 /** Scan a span for the last delimiter run of each kind (*, _, ~) whose run is
  *  not preceded by a blank — a run that could close emphasis. Records the run's
  *  start index, or -1 when there is none. */
+// The last code point of a short string (one or two UTF-16 units).
+function lastCodePoint(s) {
+  if (!s) return '';
+  const last = s.charCodeAt(s.length - 1);
+  if (last >= 0xDC00 && last <= 0xDFFF && s.length >= 2) {
+    const prev = s.charCodeAt(s.length - 2);
+    if (prev >= 0xD800 && prev <= 0xDBFF) return s.slice(-2);
+  }
+  return s.slice(-1);
+}
+
+// The UTF-16 length of the first code point of a string.
+function firstCodePointLen(s) {
+  const c0 = s.charCodeAt(0);
+  if (c0 >= 0xD800 && c0 <= 0xDBFF) {
+    const c1 = s.charCodeAt(1);
+    if (c1 >= 0xDC00 && c1 <= 0xDFFF) return 2;
+  }
+  return 1;
+}
+
+// The index of the first character that is not a space, or -1 if the string
+// holds only spaces.
+function firstNonSpace(s) {
+  let i = 0;
+  const n = s.length;
+  while (i < n && s.charCodeAt(i) === 32) i++;
+  return i < n ? i : -1;
+}
+
 function scanCloserRuns(src) {
   const found = { '*': -1, _: -1, '~': -1 };
   const n = src.length;
@@ -196,6 +226,7 @@ const ALPHA_NUMERIC = /[\p{L}\p{N}]/u;
 const NON_SPACE_START = /^\S*/;
 const END_NEWLINE = /\n$/;
 const SETEXT_LINE = /^ {0,3}(?:=+|-+) *$/;
+const SETEXT_UNDERLINE = /\n {0,3}[=-]/;
 const CARRIAGE_RETURN = /\r\n|\r/g;
 
 // ---------------------------------------------------------------------------
@@ -362,6 +393,12 @@ const TEXT_RE = new RegExp(
   '|[\\s\\S]*?(?:(?=[\\\\<!\\[`*~_]|\\b_|' + PROTOCOL + ':\\/\\/|' + WWW_START + '|$)|[^ ](?= {2,}\\n)' +
   '|[^a-zA-Z0-9](?=' + EMAIL_PROTO + ')|[^a-zA-Z0-9.!#$%&\'*+\\/=?_`{|}~-](?=' + EMAIL_LOCAL + '@))))');
 
+// Anything that can start an inline construct: an escape, tag, link, image,
+// emphasis, code span or strikethrough delimiter, a URL or email start, or a
+// hard break's two spaces before a newline. A span without any of these is
+// plain text.
+const INLINE_TRIGGER = /[\\<\[*_`~]|!\[|www\.|:\/\/|@|  \n/;
+
 // An emphasis opener: a run of * or _ followed by punctuation (but not ~)
 // or by a non-space character. Groups 1/3 hold the punctuation after a
 // *-run/_-run; groups 2/4 the plain character after one.
@@ -490,6 +527,7 @@ function dedentFence(raw, content) {
 class Engine {
   constructor() {
     this.links = Object.create(null); // normalized label -> {href, title}
+    this.hasLinks = false;            // at least one definition registered
     this.queue = [];                  // deferred inline jobs {src, tokens}
     this.inLink = false;              // inside link text or an <a> tag
     this.inRaw = false;               // inside <pre>/<code>/<kbd>/<script>
@@ -569,6 +607,12 @@ class Engine {
   }
 
   tryTable(src) {
+    // A table needs a delimiter row holding - and : or | on the second line.
+    const nl1 = src.indexOf('\n');
+    if (nl1 === -1) return null;
+    const nl2 = src.indexOf('\n', nl1 + 1);
+    const delimRow = nl2 === -1 ? src.slice(nl1 + 1) : src.slice(nl1 + 1, nl2);
+    if (!delimRow.includes('-') || (!delimRow.includes(':') && !delimRow.includes('|'))) return null;
     const m = TABLE_RE.exec(src);
     if (!m || !TABLE_DELIM.test(m[2])) return null;
     const headerCells = splitTableRow(m[1]);
@@ -594,6 +638,12 @@ class Engine {
   }
 
   tryLheading(src) {
+    // A setext underline needs a newline followed by at most three spaces and
+    // = or - before the next blank line; without one the heading pattern
+    // cannot match.
+    const blankAt = src.indexOf('\n\n');
+    const window = blankAt === -1 ? src : src.slice(0, blankAt + 1);
+    if (!SETEXT_UNDERLINE.test(window)) return null;
     const m = LHEADING_RE.exec(src);
     if (!m) return null;
     const text = m[1].trim();
@@ -701,22 +751,25 @@ class Engine {
     let item;
     while (rest) {
       let blankFollow = false;
-      let content = '';
+      const contentLines = [];
       if (!(item = itemRe.exec(rest)) || HR.test(rest)) break;
       const itemStart = consumed();
       rest = rest.substring(item[0].length);
-      const firstLine = item[2].split('\n', 1)[0];
+      const nlFirst = item[2].indexOf('\n');
+      const firstLine = nlFirst === -1 ? item[2] : item[2].slice(0, nlFirst);
       const bulletWidth = item[1].length;
-      const expanded = firstLine.replace(LEADING_BLANKS, (ws) => expandTabs(ws, bulletWidth));
-      let nextLine = rest.split('\n', 1)[0];
+      const expanded = firstLine.includes('\t')
+        ? firstLine.replace(LEADING_BLANKS, (ws) => expandTabs(ws, bulletWidth)) : firstLine;
+      const nlNext = rest.indexOf('\n');
+      const nextLine = nlNext === -1 ? rest : rest.slice(0, nlNext);
       let prevBlank = !expanded.trim();
       let contentIndent = 0;
       if (prevBlank) {
         contentIndent = bulletWidth + 1;
       } else {
-        contentIndent = expanded.search(NON_SPACE);
+        contentIndent = firstNonSpace(expanded);
         if (contentIndent > 4) contentIndent = 1;
-        content = expanded.slice(contentIndent);
+        contentLines.push(expanded.slice(contentIndent));
         contentIndent += bulletWidth;
       }
       if (prevBlank && BLANK_LINE.test(nextLine)) {
@@ -725,30 +778,49 @@ class Engine {
       }
       if (!blankFollow) {
         const pats = indentPatterns(contentIndent);
+        const maxIndent = Math.max(0, Math.min(3, contentIndent - 1));
         let prevContent = expanded;
         while (rest) {
-          const line = rest.split('\n', 1)[0];
-          nextLine = line;
-          const expandedLine = line.replace(LEADING_BLANKS, (ws) => expandTabs(ws));
-          if (pats.fence.test(line) || pats.heading.test(line) || pats.html.test(line) ||
-              pats.quote.test(line) || pats.bullet.test(line) || pats.hr.test(line)) break;
-          if (expandedLine.search(NON_SPACE) >= contentIndent || !line.trim()) {
-            content += '\n' + expandedLine.slice(contentIndent);
+          const nl = rest.indexOf('\n');
+          const line = nl === -1 ? rest : rest.slice(0, nl);
+          // The continuation stops at a line that starts a new block (fence,
+          // heading, HTML block, quote, list item or rule) within the item's
+          // indent. The first non-space character decides which test can match.
+          let sp = 0;
+          while (sp < line.length && line.charCodeAt(sp) === 32) sp++;
+          const first = line.charCodeAt(sp);
+          if (sp <= maxIndent) {
+            let stop = false;
+            if (first === 96 || first === 126) stop = line.charCodeAt(sp + 1) === first && line.charCodeAt(sp + 2) === first;
+            else if (first === 62) stop = true;
+            else if (first === 35) stop = pats.heading.test(line);
+            else if (first === 60) stop = pats.html.test(line);
+            else if (first === 45 || first === 43 || first === 42 || (first >= 48 && first <= 57)) stop = pats.bullet.test(line) || pats.hr.test(line);
+            else if (first === 95) stop = pats.hr.test(line);
+            if (stop) break;
+          }
+          const expandedLine = line.includes('\t')
+            ? line.replace(LEADING_BLANKS, (ws) => expandTabs(ws)) : line;
+          if (firstNonSpace(expandedLine) >= contentIndent || !line.trim()) {
+            contentLines.push(expandedLine.slice(contentIndent));
           } else {
-            if (prevBlank || prevContent.replace(TAB_EACH, '    ').search(NON_SPACE) >= 4 ||
+            const prevExpanded = prevContent.includes('\t')
+              ? prevContent.replace(TAB_EACH, '    ') : prevContent;
+            if (prevBlank || firstNonSpace(prevExpanded) >= 4 ||
                 pats.fence.test(prevContent) || pats.heading.test(prevContent) ||
                 pats.html.test(prevContent) || pats.hr.test(prevContent)) break;
             // A setext-looking lazy line is pushed in by four spaces so it
             // does not turn the item's paragraph into a heading.
             const lazy = SETEXT_LINE.test(line) && LHEADING_RE.test(prevContent + '\n' + line)
               ? '    ' + expandedLine.replace(LEADING_3SPACES, '') : line;
-            content += '\n' + lazy;
+            contentLines.push(lazy);
           }
           prevBlank = !line.trim();
           rest = rest.substring(line.length + 1);
           prevContent = expandedLine.slice(contentIndent);
         }
       }
+      const content = contentLines.join('\n');
       const itemRaw = full.slice(itemStart, consumed());
       if (!list.loose) {
         if (sawDoubleBlank) list.loose = true;
@@ -768,8 +840,9 @@ class Engine {
       this.top = false;
       itemTok.tokens = this.lexBlocks(itemTok.text, []);
       if (!list.loose) {
-        const spaces = itemTok.tokens.filter((t) => t.type === 'space');
-        if (spaces.length > 0 && spaces.some((t) => HAS_LINE.test(t.raw))) list.loose = true;
+        for (const t of itemTok.tokens) {
+          if (t.type === 'space' && HAS_LINE.test(t.raw)) { list.loose = true; break; }
+        }
       }
     }
     for (const itemTok of list.items) {
@@ -893,6 +966,7 @@ class Engine {
         }
         if (tok.type === 'def' && !this.links[tok.tag]) {
           this.links[tok.tag] = { href: tok.href, title: tok.title };
+          this.hasLinks = true;
         }
         out.push(tok);
         continue;
@@ -952,7 +1026,7 @@ class Engine {
   // the source, so positions line up.
   maskEmphasis(src) {
     let masked = src;
-    if (src.includes('[')) {
+    if (src.includes('[') && this.hasLinks) {
       const hide = (match) => {
         const open = match.lastIndexOf('[');
         if (!Object.hasOwn(this.links, normalizeLabel(match.slice(open + 1, -1)))) return match;
@@ -966,22 +1040,37 @@ class Engine {
       };
       masked = masked.replace(REFLINK_SEARCH, hide);
     }
-    masked = masked
-      .replace(PUNCT_OUTSIDE_CODE, (whole, ticks, punct) =>
+    // Each pass runs only when the span holds something it can match: a code
+    // span or escape for the punctuation pass, a link, code span or tag for
+    // the block-skip pass.
+    if (src.includes('`') || src.includes('\\')) {
+      masked = masked.replace(PUNCT_OUTSIDE_CODE, (whole, ticks, punct) =>
         punct ? '+'.repeat(whole.length)
           : ticks ? ticks + whole.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks
-          : whole)
-      .replace(BLOCK_SKIP, (whole) => '[' + 'a'.repeat(whole.length - 2) + ']');
+          : whole);
+    }
+    if (src.includes('[') || src.includes('`') || src.includes('<')) {
+      masked = masked.replace(BLOCK_SKIP, (whole) => '[' + 'a'.repeat(whole.length - 2) + ']');
+    }
     return masked;
   }
 
   // Lex the inline tokens of `src` into `tokens`. The emphasis mask is built
   // only when the span holds an emphasis delimiter, and the masking pass
   // itself only when it also holds a link, code span, tag or escape.
+  // Lex the inline tokens of `src` into `tokens`. A span with no inline
+  // markup at all is a single text token — most prose paragraphs take that
+  // path and skip the loop, the mask and the closer scan entirely.
   lexInline(src, tokens) {
     const savedParen = this.parenPossible;
     this.parenPossible = savedParen && src.includes(')');
     try {
+      if (src === '') return tokens;
+      if (!INLINE_TRIGGER.test(src)) {
+        if (this.inRaw) tokens.push({ type: 'text', raw: src, text: src, escaped: true });
+        else tokens.push({ type: 'text', raw: src, text: src.includes('&') ? decodeNumericRefs(src) : src, escaped: false });
+        return tokens;
+      }
       const hasDelim = src.includes('*') || src.includes('_') || src.includes('~');
       const masked = hasDelim &&
         (src.includes('[') || src.includes('`') || src.includes('<') || src.includes('\\'))
@@ -1222,7 +1311,7 @@ class Engine {
     const prevIsDelim = prevChar === delim;
     let runStart = pos;
     while (runStart > 0 && masked[runStart - 1] === delim) runStart--;
-    const beforeRun = [...masked.slice(Math.max(0, runStart - 2), runStart)].at(-1) ?? '';
+    const beforeRun = lastCodePoint(masked.slice(Math.max(0, runStart - 2), runStart));
     const beforeRunIsPunct = beforeRun === '*' || beforeRun === '_' || !!PUNCT_TEST.exec(beforeRun);
     let before = prevChar;
     if (runStart < pos) before = beforeRun;
@@ -1230,7 +1319,9 @@ class Engine {
     if (m[4] && before.match(ALPHA_NUMERIC)) return null;
     const afterIsPunct = m[1] || m[3] || '';
     if (!afterIsPunct || !before || beforeIsPunct) {
-      const openLen = [...m[0]].length - 1;
+      // The opener match is the delimiter run (ASCII) plus one following
+      // character, which a group always holds here.
+      const openLen = m[0].length - (m[1] || m[2] || m[3] || m[4]).length;
       let remaining = openLen;
       let skipped = 0;
       const runLen = pos - runStart + openLen;
@@ -1249,7 +1340,7 @@ class Engine {
       while ((closer = closerRe.exec(tail)) !== null && !(closer.index > limit)) {
         run = closer[1] || closer[2] || closer[3] || closer[4] || closer[5] || closer[6];
         if (!run) continue;
-        runLen2 = [...run].length;
+        runLen2 = run.length; // delimiter runs are ASCII
         if (closer[3] || closer[4]) { remaining += runLen2; continue; }
         if (closer[5] || closer[6] || canClose) {
           if (prevIsDelim && (closer[5] || closer[6])) break;
@@ -1258,7 +1349,7 @@ class Engine {
         remaining -= runLen2;
         if (remaining > 0) continue;
         runLen2 = Math.min(runLen2, runLen2 + remaining + skipped);
-        const leadLen = [...closer[0]][0].length;
+        const leadLen = firstCodePointLen(closer[0]);
         const raw = rest.slice(0, openLen + closer.index + leadLen + runLen2);
         if (Math.min(openLen, runLen2) % 2) {
           const inner = raw.slice(1, -1);
@@ -1277,7 +1368,7 @@ class Engine {
     const m = DEL_OPEN.exec(rest);
     if (!m) return null;
     if (!(m[1] || '') || !prevChar || PUNCT_TEST.exec(prevChar)) {
-      const openLen = [...m[0]].length - 1;
+      const openLen = m[0][1] === '~' ? 2 : 1;
       let remaining = openLen;
       const lastCloser = closers['~'];
       const searchFrom = pos + openLen;
@@ -1290,12 +1381,12 @@ class Engine {
       DEL_CLOSE.lastIndex = 0;
       while ((closer = DEL_CLOSE.exec(tail)) !== null && !(closer.index > limit)) {
         run = closer[1] || closer[2] || closer[3] || closer[4] || closer[5] || closer[6];
-        if (!run || (runLen2 = [...run].length, runLen2 !== openLen)) continue;
+        if (!run || (runLen2 = run.length, runLen2 !== openLen)) continue;
         if (closer[3] || closer[4]) { remaining += runLen2; continue; }
         remaining -= runLen2;
         if (remaining > 0) continue;
         runLen2 = Math.min(runLen2, runLen2 + remaining);
-        const leadLen = [...closer[0]][0].length;
+        const leadLen = firstCodePointLen(closer[0]);
         const raw = rest.slice(0, openLen + closer.index + leadLen + runLen2);
         const inner = raw.slice(openLen, -openLen);
         return { type: 'del', raw, text: inner, tokens: this.lexInline(inner, []) };
